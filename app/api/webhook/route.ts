@@ -53,7 +53,7 @@ async function answerCallbackQuery(callback_query_id: string, text?: string) {
   })
 }
 
-// ── Helper to generate Date Selection Buttons ────────────────────────────────
+// ── Helper Keyboards ──────────────────────────────────────────────────────────
 function generateDateKeyboard(type: string, category: string) {
   const now = new Date()
   const currentDay = now.getDate()
@@ -82,6 +82,17 @@ function generateDateKeyboard(type: string, category: string) {
   }
 
   return { inline_keyboard }
+}
+
+function generateMethodKeyboard(type: string, category: string, isoString: string) {
+  return {
+    inline_keyboard: [
+      [
+        { text: '💵 Cash', callback_data: `pay_${type}_${category}_cash_${isoString}` },
+        { text: '💳 Card', callback_data: `pay_${type}_${category}_card_${isoString}` }
+      ]
+    ]
+  }
 }
 
 // ── Keyboards ─────────────────────────────────────────────────────────────────
@@ -126,17 +137,29 @@ const pendingEntry: Record<number, { type: 'income' | 'expense'; amount: number 
 // ── Database Logic ────────────────────────────────────────────────────────────
 async function handleSummary(chat_id: number) {
   const supabase = getSupabase()
-  const { data } = await supabase.from('transactions').select('type, amount').eq('chat_id', chat_id)
+  const { data } = await supabase.from('transactions').select('type, amount, payment_method').eq('chat_id', chat_id)
 
   const income  = data?.filter(t => t.type === 'income' ).reduce((s, t) => s + Number(t.amount), 0) ?? 0
   const expense = data?.filter(t => t.type === 'expense').reduce((s, t) => s + Number(t.amount), 0) ?? 0
+
+  const cashBalance = data?.reduce((acc, t) => {
+    const value = Number(t.amount)
+    return acc + (t.payment_method === 'cash' ? (t.type === 'income' ? value : -value) : 0)
+  }, 0) ?? 0
+
+  const cardBalance = data?.reduce((acc, t) => {
+    const value = Number(t.amount)
+    return acc + (t.payment_method === 'card' ? (t.type === 'income' ? value : -value) : 0)
+  }, 0) ?? 0
 
   await sendMessage(chat_id,
     `📊 <b>All-time summary</b>\n\n` +
     `💚 Income:   <b>${income.toLocaleString()} ${CURRENCY}</b>\n` +
     `🔴 Expenses: <b>${expense.toLocaleString()} ${CURRENCY}</b>\n` +
     `─────────────────\n` +
-    `💰 Balance:  <b>${(income - expense).toLocaleString()} ${CURRENCY}</b>`,
+    `💰 Net Balance: <b>${(income - expense).toLocaleString()} ${CURRENCY}</b>\n\n` +
+    `💵 Cash Vault: <b>${cashBalance.toLocaleString()} ${CURRENCY}</b>\n` +
+    `💳 Card Vault: <b>${cardBalance.toLocaleString()} ${CURRENCY}</b>`,
     mainMenu
   )
 }
@@ -145,12 +168,15 @@ async function handlePeriod(chat_id: number, label: string, since: Date) {
   const supabase = getSupabase()
   const { data } = await supabase
     .from('transactions')
-    .select('type, amount, category')
+    .select('type, amount, category, payment_method')
     .eq('chat_id', chat_id)
     .gte('created_at', since.toISOString())
 
   const income  = data?.filter(t => t.type === 'income' ).reduce((s, t) => s + Number(t.amount), 0) ?? 0
   const expense = data?.filter(t => t.type === 'expense').reduce((s, t) => s + Number(t.amount), 0) ?? 0
+
+  const cashExp = data?.filter(t => t.type === 'expense' && t.payment_method === 'cash').reduce((s, t) => s + Number(t.amount), 0) ?? 0
+  const cardExp = data?.filter(t => t.type === 'expense' && t.payment_method === 'card').reduce((s, t) => s + Number(t.amount), 0) ?? 0
 
   const byCategory: Record<string, number> = {}
   data?.filter(t => t.type === 'expense').forEach(t => {
@@ -166,8 +192,9 @@ async function handlePeriod(chat_id: number, label: string, since: Date) {
     `${label}\n\n` +
     `💚 Income:   <b>${income.toLocaleString()} ${CURRENCY}</b>\n` +
     `🔴 Expenses: <b>${expense.toLocaleString()} ${CURRENCY}</b>\n` +
+    `   ↳ 💵 Cash: ${cashExp.toLocaleString()} | 💳 Card: ${cardExp.toLocaleString()}\n` +
     `💰 Balance:  <b>${(income - expense).toLocaleString()} ${CURRENCY}</b>\n\n` +
-    (catLines ? `<b>By category:</b>\n${catLines}` : '<i>No expenses yet</i>'),
+    (catLines ? `<b>Expenses by category:</b>\n${catLines}` : '<i>No expenses yet</i>'),
     mainMenu
   )
 }
@@ -188,13 +215,13 @@ async function handleList(chat_id: number) {
 
   await sendMessage(chat_id, `📋 <b>Last 10 transactions:</b>`, mainMenu)
 
-  // Send each transaction with an individual inline delete option
   for (const t of data) {
     const icon = t.type === 'income' ? '💚' : '🔴'
     const sign = t.type === 'income' ? '+' : '-'
+    const methodIcon = t.payment_method === 'card' ? '💳' : '💵'
     const date = new Date(t.created_at).toLocaleDateString('en-GB', { day: '2-digit', month: 'short' })
     
-    const text = `${icon} <b>${date}</b>\nAmount: <b>${sign}${Number(t.amount).toLocaleString()} ${CURRENCY}</b>\nCategory: <i>${t.category}</i>`
+    const text = `${icon} <b>${date}</b> · ${methodIcon}\nAmount: <b>${sign}${Number(t.amount).toLocaleString()} ${CURRENCY}</b>\nCategory: <i>${t.category}</i>`
     const keyboard = {
       inline_keyboard: [[{ text: '🗑️ Delete this entry', callback_data: `del_${t.id}` }]]
     }
@@ -215,18 +242,16 @@ export async function POST(req: NextRequest) {
       const chat_id = Number(from.id)
       const msg_id = message.message_id
 
-      // Action 1: User triggers deletion sequence
+      // Action 1: Handle Entry Deletion
       if (data.startsWith('del_')) {
         const transactionId = data.split('_')[1]
-
         const { error: delError } = await supabase
           .from('transactions')
           .delete()
           .eq('id', transactionId)
-          .eq('chat_id', chat_id) // Security constraint enforcement
+          .eq('chat_id', chat_id)
 
         if (delError) {
-          console.error("❌ Deletion Failed:", delError)
           await answerCallbackQuery(id, "Error deleting transaction.")
           return NextResponse.json({ ok: true })
         }
@@ -238,7 +263,7 @@ export async function POST(req: NextRequest) {
 
       await answerCallbackQuery(id)
 
-      // Action 2: User chose Category -> Move to Date Selection Screen
+      // Action 2: User picked Category -> Send to Date Panel
       if (data.startsWith('cat_')) {
         const [, type, category] = data.split('_') as ['cat', 'income' | 'expense', string]
         const pending = pendingEntry[chat_id]
@@ -259,7 +284,7 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ ok: true })
       }
 
-      // Action 3: User chose Date -> Save directly to Supabase with adjusted timestamp
+      // Action 3: User picked Date -> Send to Payment Method Panel (NEW)
       if (data.startsWith('date_')) {
         const [, type, category, dateCode, dayVal] = data.split('_') as ['date', 'income' | 'expense', string, string, string?]
         const pending = pendingEntry[chat_id]
@@ -276,12 +301,35 @@ export async function POST(req: NextRequest) {
           finalTimestamp.setDate(parseInt(dayVal))
         }
 
+        const methodKeyboard = generateMethodKeyboard(type, category, finalTimestamp.toISOString())
+        await editMessageText(chat_id, msg_id,
+          `💳 <b>Select Payment Method</b>\n\n` +
+          `Amount: <b>${pending.amount.toLocaleString()} ${CURRENCY}</b>\n` +
+          `Category: <b>${category}</b>\n` +
+          `Date: <b>${finalTimestamp.toLocaleDateString('en-GB', { day: '2-digit', month: 'short' })}</b>\n\n` +
+          `How was this handled?`,
+          methodKeyboard
+        )
+        return NextResponse.json({ ok: true })
+      }
+
+      // Action 4: User picked Payment Method -> Commit to Database (NEW)
+      if (data.startsWith('pay_')) {
+        const [, type, category, method, isoString] = data.split('_') as ['pay', 'income' | 'expense', string, 'cash' | 'card', string]
+        const pending = pendingEntry[chat_id]
+
+        if (!pending) {
+          await editMessageText(chat_id, msg_id, '⚠️ Session expired. Please start over.')
+          return NextResponse.json({ ok: true })
+        }
+
         const { error: dbError } = await supabase.from('transactions').insert({
           chat_id,
           type: pending.type,
           amount: Number(pending.amount),
           category,
-          created_at: finalTimestamp.toISOString(),
+          created_at: isoString,
+          payment_method: method
         })
 
         if (dbError) {
@@ -293,13 +341,15 @@ export async function POST(req: NextRequest) {
         delete pendingEntry[chat_id]
 
         const sign = type === 'income' ? '+' : '-'
-        const formattedDate = finalTimestamp.toLocaleDateString('en-GB', { day: '2-digit', month: 'long' })
+        const methodDisplay = method === 'card' ? '💳 Card' : '💵 Cash'
+        const formattedDate = new Date(isoString).toLocaleDateString('en-GB', { day: '2-digit', month: 'long' })
         
         await editMessageText(chat_id, msg_id,
-          `✅ <b>Transaction Saved Logged</b>\n\n` +
+          `✅ <b>Transaction Logged Successfully</b>\n\n` +
           `Type: <b>${type === 'income' ? 'Income' : 'Expense'}</b>\n` +
           `Amount: <b>${sign}${pending.amount.toLocaleString()} ${CURRENCY}</b>\n` +
           `Category: <b>${category}</b>\n` +
+          `Method: <b>${methodDisplay}</b>\n` +
           `Date: <b>${formattedDate}</b>`
         )
         return NextResponse.json({ ok: true })
