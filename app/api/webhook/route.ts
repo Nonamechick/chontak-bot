@@ -6,7 +6,6 @@ export const dynamic = 'force-dynamic'
 const TOKEN = process.env.BOT_TOKEN!
 const CURRENCY = "so'm"
 
-// Lazy-load Supabase helper to prevent build or environment configuration locks
 function getSupabase() {
   const url = process.env.SUPABASE_URL
   const key = process.env.SUPABASE_KEY
@@ -28,22 +27,64 @@ async function sendMessage(chat_id: number, text: string, reply_markup?: object)
       reply_markup: reply_markup ? JSON.stringify(reply_markup) : undefined 
     })
   })
-
-  if (!res.ok) {
-    const errData = await res.json()
-    console.error("❌ Telegram API Error:", errData)
-  }
+  if (!res.ok) console.error("❌ Telegram API Error:", await res.json())
 }
 
-async function answerCallbackQuery(callback_query_id: string) {
+async function editMessageText(chat_id: number, message_id: number, text: string, reply_markup?: object) {
+  const res = await fetch(`https://api.telegram.org/bot${TOKEN}/editMessageText`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id,
+      message_id,
+      text,
+      parse_mode: 'HTML',
+      reply_markup: reply_markup ? JSON.stringify(reply_markup) : undefined
+    })
+  })
+  if (!res.ok) console.error("❌ Telegram Edit Error:", await res.json())
+}
+
+async function answerCallbackQuery(callback_query_id: string, text?: string) {
   await fetch(`https://api.telegram.org/bot${TOKEN}/answerCallbackQuery`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ callback_query_id })
+    body: JSON.stringify({ callback_query_id, text })
   })
 }
 
-// ── Persistent & Inline Keyboards ────────────────────────────────────────────
+// ── Helper to generate Date Selection Buttons ────────────────────────────────
+function generateDateKeyboard(type: string, category: string) {
+  const now = new Date()
+  const currentDay = now.getDate()
+  
+  const inline_keyboard: any[][] = [
+    [
+      { text: '📍 Today', callback_data: `date_${type}_${category}_today` },
+      { text: '⏳ Yesterday', callback_data: `date_${type}_${category}_yesterday` }
+    ]
+  ]
+
+  let tempRow: any[] = []
+  for (let d = currentDay - 2; d >= 1; d--) {
+    const paddedDay = d.toString().padStart(2, '0')
+    const monthLabel = now.toLocaleString('en', { month: 'short' })
+    
+    tempRow.push({ 
+      text: `${paddedDay} ${monthLabel}`, 
+      callback_data: `date_${type}_${category}_day_${d}` 
+    })
+
+    if (tempRow.length === 3 || d === 1) {
+      inline_keyboard.push(tempRow)
+      tempRow = []
+    }
+  }
+
+  return { inline_keyboard }
+}
+
+// ── Keyboards ─────────────────────────────────────────────────────────────────
 const mainMenu = {
   keyboard: [
     [{ text: '➕ Add income' },  { text: '➖ Add expense' }],
@@ -52,7 +93,6 @@ const mainMenu = {
     [{ text: '❓ Help' }],
   ],
   resize_keyboard: true,
-  one_time_keyboard: false,
 }
 
 const incomeCategories = {
@@ -79,23 +119,14 @@ const expenseCategories = {
   ]
 }
 
-// ── In-Memory States ──────────────────────────────────────────────────────────
+// ── In-Memory State ──────────────────────────────────────────────────────────
 const userState: Record<number, 'AWAITING_INCOME_AMOUNT' | 'AWAITING_EXPENSE_AMOUNT'> = {}
 const pendingEntry: Record<number, { type: 'income' | 'expense'; amount: number }> = {}
 
-// ── Database Queries & Business Logic ────────────────────────────────────────
+// ── Database Logic ────────────────────────────────────────────────────────────
 async function handleSummary(chat_id: number) {
   const supabase = getSupabase()
-  const { data, error } = await supabase
-    .from('transactions')
-    .select('type, amount')
-    .eq('chat_id', chat_id)
-
-  if (error) {
-    console.error("❌ Supabase Fetch Summary Error:", error)
-    await sendMessage(chat_id, `❌ Database error: <code>${error.message}</code>`, mainMenu)
-    return
-  }
+  const { data } = await supabase.from('transactions').select('type, amount').eq('chat_id', chat_id)
 
   const income  = data?.filter(t => t.type === 'income' ).reduce((s, t) => s + Number(t.amount), 0) ?? 0
   const expense = data?.filter(t => t.type === 'expense').reduce((s, t) => s + Number(t.amount), 0) ?? 0
@@ -112,17 +143,11 @@ async function handleSummary(chat_id: number) {
 
 async function handlePeriod(chat_id: number, label: string, since: Date) {
   const supabase = getSupabase()
-  const { data, error } = await supabase
+  const { data } = await supabase
     .from('transactions')
     .select('type, amount, category')
     .eq('chat_id', chat_id)
     .gte('created_at', since.toISOString())
-
-  if (error) {
-    console.error("❌ Supabase Fetch Period Error:", error)
-    await sendMessage(chat_id, `❌ Database error: <code>${error.message}</code>`, mainMenu)
-    return
-  }
 
   const income  = data?.filter(t => t.type === 'income' ).reduce((s, t) => s + Number(t.amount), 0) ?? 0
   const expense = data?.filter(t => t.type === 'expense').reduce((s, t) => s + Number(t.amount), 0) ?? 0
@@ -149,93 +174,148 @@ async function handlePeriod(chat_id: number, label: string, since: Date) {
 
 async function handleList(chat_id: number) {
   const supabase = getSupabase()
-  const { data, error } = await supabase
+  const { data } = await supabase
     .from('transactions')
     .select('*')
     .eq('chat_id', chat_id)
     .order('created_at', { ascending: false })
     .limit(10)
 
-  if (error) {
-    console.error("❌ Supabase Fetch List Error:", error)
-    await sendMessage(chat_id, `❌ Database error: <code>${error.message}</code>`, mainMenu)
-    return
-  }
-
   if (!data?.length) {
     await sendMessage(chat_id, '<i>No transactions found yet.</i>', mainMenu)
     return
   }
 
-  const lines = data.map(t => {
-    const icon = t.type === 'income' ? '💚' : '🔴'
-    const date = new Date(t.created_at).toLocaleDateString('en-GB', { day: '2-digit', month: 'short' })
-    return `${icon} ${date}  <b>${Number(t.amount).toLocaleString()} ${CURRENCY}</b>  ·  <i>${t.category}</i>`
-  })
+  await sendMessage(chat_id, `📋 <b>Last 10 transactions:</b>`, mainMenu)
 
-  await sendMessage(chat_id, `📋 <b>Last 10 transactions</b>\n\n${lines.join('\n')}`, mainMenu)
+  // Send each transaction with an individual inline delete option
+  for (const t of data) {
+    const icon = t.type === 'income' ? '💚' : '🔴'
+    const sign = t.type === 'income' ? '+' : '-'
+    const date = new Date(t.created_at).toLocaleDateString('en-GB', { day: '2-digit', month: 'short' })
+    
+    const text = `${icon} <b>${date}</b>\nAmount: <b>${sign}${Number(t.amount).toLocaleString()} ${CURRENCY}</b>\nCategory: <i>${t.category}</i>`
+    const keyboard = {
+      inline_keyboard: [[{ text: '🗑️ Delete this entry', callback_data: `del_${t.id}` }]]
+    }
+    
+    await sendMessage(chat_id, text, keyboard)
+  }
 }
 
-// ── Core Webhook API Router ──────────────────────────────────────────────────
+// ── Webhook Core API ─────────────────────────────────────────────────────────
 export async function POST(req: NextRequest) {
   try {
     const supabase = getSupabase()
     const body = await req.json()
 
-    // ── Context 1: Inline button category confirmation selection ──────────────
+    // ── Context 1: Inline button callback events ─────────────────────────────
     if (body.callback_query) {
-      const { id, from, data } = body.callback_query
+      const { id, from, data, message } = body.callback_query
       const chat_id = Number(from.id)
+      const msg_id = message.message_id
+
+      // Action 1: User triggers deletion sequence
+      if (data.startsWith('del_')) {
+        const transactionId = data.split('_')[1]
+
+        const { error: delError } = await supabase
+          .from('transactions')
+          .delete()
+          .eq('id', transactionId)
+          .eq('chat_id', chat_id) // Security constraint enforcement
+
+        if (delError) {
+          console.error("❌ Deletion Failed:", delError)
+          await answerCallbackQuery(id, "Error deleting transaction.")
+          return NextResponse.json({ ok: true })
+        }
+
+        await answerCallbackQuery(id, "Transaction deleted.")
+        await editMessageText(chat_id, msg_id, `🗑️ <b>Transaction successfully wiped out.</b>`)
+        return NextResponse.json({ ok: true })
+      }
+
       await answerCallbackQuery(id)
 
-      const [, type, category] = data.split('_') as ['cat', 'income' | 'expense', string]
-      const pending = pendingEntry[chat_id]
+      // Action 2: User chose Category -> Move to Date Selection Screen
+      if (data.startsWith('cat_')) {
+        const [, type, category] = data.split('_') as ['cat', 'income' | 'expense', string]
+        const pending = pendingEntry[chat_id]
 
-      if (!pending) {
-        await sendMessage(chat_id, '⚠️ Session expired. Please start over.', mainMenu)
+        if (!pending) {
+          await editMessageText(chat_id, msg_id, '⚠️ Session expired. Please start over.')
+          return NextResponse.json({ ok: true })
+        }
+
+        const dateKeyboard = generateDateKeyboard(type, category)
+        await editMessageText(chat_id, msg_id, 
+          `📅 <b>Select Transaction Date</b>\n\n` +
+          `Amount: <b>${pending.amount.toLocaleString()} ${CURRENCY}</b>\n` +
+          `Category: <b>${category}</b>\n\n` +
+          `When did this happen?`, 
+          dateKeyboard
+        )
         return NextResponse.json({ ok: true })
       }
 
-      // Explicit numeric type-casts to ensure database matching layouts map safely
-      const { error: dbError } = await supabase.from('transactions').insert({
-        chat_id,
-        type: pending.type,
-        amount: Number(pending.amount),
-        category,
-      })
+      // Action 3: User chose Date -> Save directly to Supabase with adjusted timestamp
+      if (data.startsWith('date_')) {
+        const [, type, category, dateCode, dayVal] = data.split('_') as ['date', 'income' | 'expense', string, string, string?]
+        const pending = pendingEntry[chat_id]
 
-      if (dbError) {
-        console.error("❌ Supabase Transaction Insert Failed:", dbError)
-        await sendMessage(chat_id, `❌ Database write failed: <code>${dbError.message}</code>`, mainMenu)
+        if (!pending) {
+          await editMessageText(chat_id, msg_id, '⚠️ Session expired. Please start over.')
+          return NextResponse.json({ ok: true })
+        }
+
+        const finalTimestamp = new Date()
+        if (dateCode === 'yesterday') {
+          finalTimestamp.setDate(finalTimestamp.getDate() - 1)
+        } else if (dateCode === 'day' && dayVal) {
+          finalTimestamp.setDate(parseInt(dayVal))
+        }
+
+        const { error: dbError } = await supabase.from('transactions').insert({
+          chat_id,
+          type: pending.type,
+          amount: Number(pending.amount),
+          category,
+          created_at: finalTimestamp.toISOString(),
+        })
+
+        if (dbError) {
+          console.error("❌ Supabase Insertion Error:", dbError)
+          await editMessageText(chat_id, msg_id, `❌ Database write failed: <code>${dbError.message}</code>`)
+          return NextResponse.json({ ok: true })
+        }
+
+        delete pendingEntry[chat_id]
+
+        const sign = type === 'income' ? '+' : '-'
+        const formattedDate = finalTimestamp.toLocaleDateString('en-GB', { day: '2-digit', month: 'long' })
+        
+        await editMessageText(chat_id, msg_id,
+          `✅ <b>Transaction Saved Logged</b>\n\n` +
+          `Type: <b>${type === 'income' ? 'Income' : 'Expense'}</b>\n` +
+          `Amount: <b>${sign}${pending.amount.toLocaleString()} ${CURRENCY}</b>\n` +
+          `Category: <b>${category}</b>\n` +
+          `Date: <b>${formattedDate}</b>`
+        )
         return NextResponse.json({ ok: true })
       }
-
-      delete pendingEntry[chat_id]
-
-      const sign = pending.type === 'income' ? '+' : '-'
-      await sendMessage(chat_id,
-        `✅ <b>${pending.type === 'income' ? 'Income' : 'Expense'} saved</b>\n` +
-        `${sign}${pending.amount.toLocaleString()} ${CURRENCY}  ·  ${category}`,
-        mainMenu
-      )
-      return NextResponse.json({ ok: true })
     }
 
-    // ── Context 2: Regular user chat text payload handling ───────────────────
-    const message = body.message
-    if (!message?.text) return NextResponse.json({ ok: true })
+    // ── Context 2: Normal Message Event Pipeline ─────────────────────────────
+    const msg = body.message
+    if (!msg?.text) return NextResponse.json({ ok: true })
 
-    const chat_id: number = Number(message.chat.id)
-    const text: string    = message.text.trim()
+    const chat_id: number = Number(msg.chat.id)
+    const text: string    = msg.text.trim()
 
-    // Synchronize core account row profile logs 
-    const { error: userError } = await supabase.from('users').upsert({ chat_id }, { onConflict: 'chat_id' })
-    if (userError) console.error("❌ Supabase Profile Handshake Error:", userError)
+    await supabase.from('users').upsert({ chat_id }, { onConflict: 'chat_id' })
 
-    // Capture explicit active workflow states
     const currentState = userState[chat_id]
-    
-    // Regular expression cleans inner numbering spacing tokens safely (e.g. "15 000" -> "15000")
     const cleanText = text.replace(/\s(?=\d)/g, '')
     const parsedAmount = parseFloat(cleanText)
 
@@ -247,7 +327,6 @@ export async function POST(req: NextRequest) {
         await sendMessage(chat_id, `💚 <b>${parsedAmount.toLocaleString()} ${CURRENCY}</b> — choose a category:`, incomeCategories)
         return NextResponse.json({ ok: true })
       } 
-      
       if (currentState === 'AWAITING_EXPENSE_AMOUNT') {
         pendingEntry[chat_id] = { type: 'expense', amount: parsedAmount }
         await sendMessage(chat_id, `🔴 <b>${parsedAmount.toLocaleString()} ${CURRENCY}</b> — choose a category:`, expenseCategories)
@@ -255,7 +334,6 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // Command conversion maps for native application menu routing
     const textMap: Record<string, string> = {
       '➕ add income':  '/add_income',
       '➖ add expense': '/add_expense',
@@ -325,10 +403,7 @@ export async function POST(req: NextRequest) {
         mainMenu
       )
     } else {
-      await sendMessage(chat_id,
-        `Use the menu buttons below or type an amount directly.`,
-        mainMenu
-      )
+      await sendMessage(chat_id, `Use the menu buttons below or type an amount directly.`, mainMenu)
     }
     return NextResponse.json({ ok: true })
   } catch (err: any) {
