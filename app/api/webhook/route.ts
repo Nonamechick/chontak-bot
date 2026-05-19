@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
 
+export const dynamic = 'force-dynamic'
+
 const TOKEN = process.env.BOT_TOKEN!
 const CURRENCY = "so'm"
 
@@ -19,7 +21,13 @@ async function sendMessage(chat_id: number, text: string, reply_markup?: object)
   await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id, text, parse_mode: 'Markdown', reply_markup })
+    body: JSON.stringify({ 
+      chat_id, 
+      text, 
+      parse_mode: 'Markdown', 
+      // Telegram requires reply_markup to be a JSON string stringified
+      reply_markup: reply_markup ? JSON.stringify(reply_markup) : undefined 
+    })
   })
 }
 
@@ -88,7 +96,8 @@ async function handleSummary(chat_id: number) {
     `─────────────────\n` +
     `💰 Balance:  *${(income - expense).toLocaleString()} ${CURRENCY}*`,
     mainMenu
-  )}
+  )
+}
 
 async function handlePeriod(chat_id: number, label: string, since: Date) {
   const supabase = getSupabase()
@@ -118,7 +127,8 @@ async function handlePeriod(chat_id: number, label: string, since: Date) {
     `💰 Balance:  *${(income - expense).toLocaleString()} ${CURRENCY}*\n\n` +
     (catLines ? `*By category:*\n${catLines}` : '_No expenses yet_'),
     mainMenu
-  )}
+  )
+}
 
 async function handleList(chat_id: number) {
   const supabase = getSupabase()
@@ -145,116 +155,121 @@ async function handleList(chat_id: number) {
 
 // ── Webhook handler ───────────────────────────────────────────────────────────
 export async function POST(req: NextRequest) {
-  const supabase = getSupabase()
-  const body = await req.json()
+  try {
+    const supabase = getSupabase()
+    const body = await req.json()
 
-  // ── Inline button tapped ──────────────────────────────────────────────────
-  if (body.callback_query) {
-    const { id, from, data } = body.callback_query
-    const chat_id = from.id
-    await answerCallbackQuery(id)
+    // ── Inline button tapped ──────────────────────────────────────────────────
+    if (body.callback_query) {
+      const { id, from, data } = body.callback_query
+      const chat_id = from.id
+      await answerCallbackQuery(id)
 
-    const [, type, category] = data.split('_') as ['cat', 'income' | 'expense', string]
-    const pending = pendingEntry[chat_id]
+      const [, type, category] = data.split('_') as ['cat', 'income' | 'expense', string]
+      const pending = pendingEntry[chat_id]
 
-    if (!pending) {
-      await sendMessage(chat_id, '⚠️ Session expired. Please start again.', mainMenu)
+      if (!pending) {
+        await sendMessage(chat_id, '⚠️ Session expired. Please start again.', mainMenu)
+        return NextResponse.json({ ok: true })
+      }
+
+      delete pendingEntry[chat_id]
+      await supabase.from('transactions').insert({
+        chat_id,
+        type: pending.type,
+        amount: pending.amount,
+        category,
+      })
+
+      const sign = pending.type === 'income' ? '+' : '-'
+      await sendMessage(chat_id,
+        `✅ *${pending.type === 'income' ? 'Income' : 'Expense'} saved*\n` +
+        `${sign}${pending.amount.toLocaleString()} ${CURRENCY}  ·  ${category}`,
+        mainMenu
+      )
       return NextResponse.json({ ok: true })
     }
 
-    delete pendingEntry[chat_id]
-    await supabase.from('transactions').insert({
-      chat_id,
-      type: pending.type,
-      amount: pending.amount,
-      category,
-    })
+    // ── Regular message ───────────────────────────────────────────────────────
+    const message = body.message
+    if (!message?.text) return NextResponse.json({ ok: true })
 
-    const sign = pending.type === 'income' ? '+' : '-'
-    await sendMessage(chat_id,
-      `✅ *${pending.type === 'income' ? 'Income' : 'Expense'} saved*\n` +
-      `${sign}${pending.amount.toLocaleString()} ${CURRENCY}  ·  ${category}`,
-      mainMenu
-    )
+    const chat_id: number = message.chat.id
+    const text: string    = message.text.trim()
+
+    await supabase.from('users').upsert({ chat_id }, { onConflict: 'chat_id' })
+
+    const textMap: Record<string, string> = {
+      '➕ add income':  '/add_income',
+      '➖ add expense': '/add_expense',
+      '📊 summary':     '/summary',
+      '📅 this month':  '/month',
+      '📆 this week':   '/week',
+      '📋 last 10':     '/list',
+      '❓ help':        '/help',
+    }
+
+    const cmd = textMap[text.toLowerCase()] ?? text
+
+    if (cmd === '/start') {
+      await sendMessage(chat_id,
+        `👋 *Salom! Finance Bot*\n\nTrack your income & expenses in *so'm*.\nUse the buttons below to get started.`,
+        mainMenu
+      )
+    } else if (cmd.startsWith('/add_income')) {
+      const amount = parseFloat(cmd.split(' ')[1])
+      if (isNaN(amount)) {
+        await sendMessage(chat_id, `💚 *Add income*\n\nSend the amount:\n\`/add_income 500000\``)
+      } else {
+        pendingEntry[chat_id] = { type: 'income', amount }
+        await sendMessage(chat_id, `💚 *${amount.toLocaleString()} ${CURRENCY}* — choose a category:`, incomeCategories)
+      }
+    } else if (cmd.startsWith('/add_expense')) {
+      const amount = parseFloat(cmd.split(' ')[1])
+      if (isNaN(amount)) {
+        await sendMessage(chat_id, `🔴 *Add expense*\n\nSend the amount:\n\`/add_expense 50000\``)
+      } else {
+        pendingEntry[chat_id] = { type: 'expense', amount }
+        await sendMessage(chat_id, `🔴 *${amount.toLocaleString()} ${CURRENCY}* — choose a category:`, expenseCategories)
+      }
+    } else if (cmd === '/summary') {
+      await handleSummary(chat_id)
+    } else if (cmd === '/month') {
+      const now = new Date()
+      const start = new Date(now.getFullYear(), now.getMonth(), 1)
+      const monthName = now.toLocaleString('en', { month: 'long' })
+      await handlePeriod(chat_id, `📅 *${monthName} summary*`, start)
+    } else if (cmd === '/week') {
+      const now = new Date()
+      const day = now.getDay()
+      const diffToMonday = (day === 0 ? -6 : 1 - day)
+      const start = new Date(now)
+      start.setDate(now.getDate() + diffToMonday)
+      start.setHours(0, 0, 0, 0)
+      await handlePeriod(chat_id, `📆 *This week's summary*`, start)
+    } else if (cmd === '/list') {
+      await handleList(chat_id)
+    } else if (cmd === '/help') {
+      await sendMessage(chat_id,
+        `*Commands*\n\n` +
+        `/add_income 500000  — add income\n` +
+        `/add_expense 50000  — add expense\n` +
+        `/summary            — all-time totals\n` +
+        `/month              — this month\n` +
+        `/week               — this week\n` +
+        `/list               — last 10 transactions\n\n` +
+        `_Default currency: so'm (UZS)_`,
+        mainMenu
+      )
+    } else {
+      await sendMessage(chat_id,
+        `Use the buttons below or:\n/add_income 500000\n/add_expense 50000`,
+        mainMenu
+      )
+    }
     return NextResponse.json({ ok: true })
+  } catch (err: any) {
+    console.error("💥 WEBHOOK ERROR:", err.message || err)
+    return NextResponse.json({ ok: false, error: err.message }, { status: 500 })
   }
-
-  // ── Regular message ───────────────────────────────────────────────────────
-  const message = body.message
-  if (!message?.text) return NextResponse.json({ ok: true })
-
-  const chat_id: number = message.chat.id
-  const text: string    = message.text.trim()
-
-  await supabase.from('users').upsert({ chat_id }, { onConflict: 'chat_id' })
-
-  const textMap: Record<string, string> = {
-    '➕ add income':  '/add_income',
-    '➖ add expense': '/add_expense',
-    '📊 summary':     '/summary',
-    '📅 this month':  '/month',
-    '📆 this week':   '/week',
-    '📋 last 10':     '/list',
-    '❓ help':        '/help',
-  }
-
-  const cmd = textMap[text.toLowerCase()] ?? text
-
-  if (cmd === '/start') {
-    await sendMessage(chat_id,
-      `👋 *Salom! Finance Bot*\n\nTrack your income & expenses in *so'm*.\nUse the buttons below to get started.`,
-      mainMenu
-    )
-  } else if (cmd.startsWith('/add_income')) {
-    const amount = parseFloat(cmd.split(' ')[1])
-    if (isNaN(amount)) {
-      await sendMessage(chat_id, `💚 *Add income*\n\nSend the amount:\n\`/add_income 500000\``)
-    } else {
-      pendingEntry[chat_id] = { type: 'income', amount }
-      await sendMessage(chat_id, `💚 *${amount.toLocaleString()} ${CURRENCY}* — choose a category:`, incomeCategories)
-    }
-  } else if (cmd.startsWith('/add_expense')) {
-    const amount = parseFloat(cmd.split(' ')[1])
-    if (isNaN(amount)) {
-      await sendMessage(chat_id, `🔴 *Add expense*\n\nSend the amount:\n\`/add_expense 50000\``)
-    } else {
-      pendingEntry[chat_id] = { type: 'expense', amount }
-      await sendMessage(chat_id, `🔴 *${amount.toLocaleString()} ${CURRENCY}* — choose a category:`, expenseCategories)
-    }
-  } else if (cmd === '/summary') {
-    await handleSummary(chat_id)
-  } else if (cmd === '/month') {
-    const now = new Date()
-    const start = new Date(now.getFullYear(), now.getMonth(), 1)
-    const monthName = now.toLocaleString('en', { month: 'long' })
-    await handlePeriod(chat_id, `📅 *${monthName} summary*`, start)
-  } else if (cmd === '/week') {
-    const now = new Date()
-    const day = now.getDay()
-    const diffToMonday = (day === 0 ? -6 : 1 - day)
-    const start = new Date(now)
-    start.setDate(now.getDate() + diffToMonday)
-    start.setHours(0, 0, 0, 0)
-    await handlePeriod(chat_id, `📆 *This week's summary*`, start)
-  } else if (cmd === '/list') {
-    await handleList(chat_id)
-  } else if (cmd === '/help') {
-    await sendMessage(chat_id,
-      `*Commands*\n\n` +
-      `/add_income 500000  — add income\n` +
-      `/add_expense 50000  — add expense\n` +
-      `/summary            — all-time totals\n` +
-      `/month              — this month\n` +
-      `/week               — this week\n` +
-      `/list               — last 10 transactions\n\n` +
-      `_Default currency: so'm (UZS)_`,
-      mainMenu
-    )
-  } else {
-    await sendMessage(chat_id,
-      `Use the buttons below or:\n/add_income 500000\n/add_expense 50000`,
-      mainMenu
-    )
-  }
-  return NextResponse.json({ ok: true })
 }
